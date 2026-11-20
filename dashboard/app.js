@@ -7,6 +7,12 @@
 // (TVL, seven-day growth, age with no token, chain breadth, a category factor the snapshot computes),
 // never a price and never a promise that a token is coming. Wrapped, staked and bridged products are
 // left out of the board: their token already trades.
+//
+// The page recomputes what main.ts wrote, in two places, so the board's numbers can be checked
+// without leaving the page: impliedOf rebuilds a row's implied value from the snapshot figures,
+// and the detail drawer shows the recomputed number beside the one board.json carries. The Top
+// movers panel and the By category table are computed the same way, from the rows data.js ships:
+// nothing on this page is typed in by hand.
 (function () {
   'use strict';
 
@@ -98,19 +104,32 @@
     if (chain === 'Ethereum' || chain === 'Bitcoin') return { first: 'about $5 of gas for the first transaction', setup: 'about $8 of gas', weekly: 'about $3 of gas a week' };
     return { first: 'under $1 of gas for the first transaction', setup: 'about $2 of gas', weekly: 'under $1 of gas a week' };
   }
+  // One farm-action rule: the category words it matches and the action it writes. The rules are
+  // tried in the order they are listed and the first match wins, so the order below is the rule:
+  // a lending market that also yields is still a lending market, and a curator that also stakes
+  // is still a curator. The words are matched against the category in lower case.
+  var FARM_ACTIONS = [
+    { words: ['lend', 'cdp', 'collateral'], action: function (name, capital, chain) { return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ' and keep the position open.'; } },
+    { words: ['dex', 'yield', 'leveraged farm'], action: function (name, capital, chain) { return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open.'; } },
+    { words: ['staking', 'restak'], action: function (name, capital, chain) { return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt.'; } },
+    { words: ['perpetual', 'derivative'], action: function (name, capital, chain) { return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' and open one small hedge.'; } },
+    { words: ['prediction'], action: function (name, capital, chain) { return 'Fund $' + capital + ' and place one market position on ' + name + '.'; } },
+    { words: ['curator', 'allocator'], action: function (name, capital, chain) { return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the shares.'; } },
+    { words: ['stable'], action: function (name, capital, chain) { return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.'; } },
+    { words: ['rwa'], action: function (name, capital, chain) { return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.'; } },
+    { words: ['insurance'], action: function (name, capital, chain) { return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.'; } }
+  ];
+  // The category's one action, in the words a farmer can follow. The first rule whose words
+  // appear in the category wins; a protocol whose category matches no rule gets the plain deposit.
   function actionFor(p, capital, chain) {
     var c = (p.category || '').toLowerCase();
-    var name = p.name;
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ' and keep the position open.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open.';
-    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' and open one small hedge.';
-    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' and place one market position on ' + name + '.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the shares.';
-    if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.';
-    if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.';
-    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.';
-    return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
+    for (var i = 0; i < FARM_ACTIONS.length; i++) {
+      var rule = FARM_ACTIONS[i];
+      for (var j = 0; j < rule.words.length; j++) {
+        if (c.indexOf(rule.words[j]) >= 0) return rule.action(p.name, capital, chain);
+      }
+    }
+    return 'Deposit $' + capital + ' of USDC into ' + p.name + ' on ' + chain + ' and keep the position open.';
   }
   function stepText(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
@@ -195,6 +214,47 @@
     if (best === t) return '#' + t + ' by TVL on the board';
     if (best === g) return '#' + g + ' by seven-day growth on the board';
     return '#' + a + ' by age with no token on the board';
+  }
+
+  // The week's biggest movers: the pre-token rows with the largest seven-day growth the snapshot
+  // records. A mover is ranked by the growth figure alone, not by implied value, so the panel shows
+  // momentum the board's order hides: a protocol can be the week's fastest grower and still sit far
+  // down the board, because one week of growth is only one of the model's five multipliers. Rows
+  // with no growth figure sit at the bottom, never at the top, and the slug breaks ties so the
+  // order is the same on every load.
+  function topMovers() {
+    return DATA.rows.slice().sort(function (a, b) {
+      var av = a.change_7d === null || a.change_7d === undefined ? -Infinity : a.change_7d;
+      var bv = b.change_7d === null || b.change_7d === undefined ? -Infinity : b.change_7d;
+      if (av !== bv) return bv - av;
+      return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+    }).slice(0, 5);
+  }
+
+  // The board by category: how many pre-token protocols each category holds, the median TVL of the
+  // category's rows, and the category's strongest row by implied value. The median here is the
+  // upper median, the same definition the model's category factor uses, so this table and the model
+  // agree about what a category's middle looks like. Categories are ordered by how many protocols
+  // they hold, most first, with the name breaking ties.
+  function categoryStats() {
+    var byCat = {};
+    DATA.rows.forEach(function (r) {
+      var key = r.category || 'Other';
+      if (!byCat[key]) byCat[key] = [];
+      byCat[key].push(r);
+    });
+    return Object.keys(byCat).sort().map(function (key) {
+      var list = byCat[key].slice().sort(function (a, b) { return a.tvl_usd - b.tvl_usd; });
+      var median = list[Math.floor(list.length / 2)].tvl_usd;
+      var top = byCat[key].slice().sort(function (a, b) {
+        if (a.implied_value_usd !== b.implied_value_usd) return b.implied_value_usd - a.implied_value_usd;
+        return a.slug < b.slug ? -1 : 1;
+      })[0];
+      return { category: key, count: list.length, medianTvl: median, top: top };
+    }).sort(function (a, b) {
+      if (a.count !== b.count) return b.count - a.count;
+      return a.category < b.category ? -1 : 1;
+    });
   }
 
   function header() {
@@ -354,6 +414,65 @@
     );
   }
 
+  // The week's biggest movers, as cards: each one shows the protocol's board rank, its seven-day
+  // growth, and the implied value that growth feeds into. Selecting a card opens the same detail
+  // drawer the board's rows open, so a mover and a top row are inspected the same way.
+  function moversPanel() {
+    var movers = topMovers();
+    return el('section', { class: 'panel movers', 'aria-label': 'Top movers by seven-day growth' },
+      el('h2', { text: 'Top movers (7d)' }),
+      el('p', { class: 'sub', text: 'The five pre-token protocols with the largest seven-day TVL growth in the snapshot. Ranked by that growth alone — a fast week is momentum, not a promise, and a mover can sit far down the board on implied value.' }),
+      el('div', { class: 'movers-grid' },
+        movers.map(function (r) {
+          return el('article', { class: 'mover', tabindex: '0', onclick: function () { openDetail(r.slug); }, onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } } },
+            el('span', { class: 'rank-badge', text: '#' + r.rank }),
+            el('b', { class: 'mover-name', text: r.name }),
+            el('span', { class: 'sub', text: (r.category || 'Other') + ' · ' + fmtAge(r.age_days) }),
+            el('span', { class: 'num mover-growth ' + (r.change_7d !== null && r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) + ' in 7 days' }),
+            el('span', { class: 'num mover-value', text: fmtUsd(r.implied_value_usd) + ' implied' })
+          );
+        })
+      )
+    );
+  }
+
+  // The board by category, as a table: every category on the board, how many pre-token protocols
+  // it holds, the median TVL of its rows, and its strongest row by implied value. Selecting a row
+  // opens that protocol's detail drawer, so a category's leader is one click from its farm plan.
+  function categoryPanel() {
+    var stats = categoryStats();
+    var tbody = el('tbody');
+    stats.forEach(function (s) {
+      tbody.appendChild(el('tr', {
+        tabindex: '0',
+        onclick: function () { openDetail(s.top.slug); },
+        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(s.top.slug); } }
+      },
+        el('td', null, el('b', { text: s.category })),
+        el('td', { class: 'num', text: String(s.count) }),
+        el('td', { class: 'num', text: fmtUsd(s.medianTvl) }),
+        el('td', null, el('div', { class: 'name' }, el('b', { text: s.top.name }), el('span', { class: 'sub', text: 'Rank ' + s.top.rank + ' on the board' }))),
+        el('td', { class: 'num', text: fmtUsd(s.top.implied_value_usd) })
+      ));
+    });
+    return el('section', { class: 'panel categories', 'aria-label': 'Board by category' },
+      el('h2', { text: 'By category' }),
+      el('p', { class: 'sub', text: 'Every category on the board: how many pre-token protocols it holds, the median TVL of its rows, and its strongest row by implied value. Select a row to open that protocol.' }),
+      el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Category' }),
+            el('th', { scope: 'col', text: 'Protocols' }),
+            el('th', { scope: 'col', text: 'Median TVL' }),
+            el('th', { scope: 'col', text: 'Strongest protocol' }),
+            el('th', { scope: 'col', text: 'Implied value' })
+          )),
+          tbody
+        )
+      )
+    );
+  }
+
   function modelPanel() {
     var m = DATA.model;
     return el('section', { class: 'panel model' },
@@ -362,6 +481,15 @@
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x ' + m.base_multiple + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + (1 - m.maturity_floor).toFixed(2) + ') x (' + m.chains_base + ' + 0.03 x min(chains, ' + m.chains_cap + ')) x category )'
       ),
+      el('div', { class: 'mult-table' },
+        el('div', { class: 'mult-row mult-head' }, el('span', { text: 'Multiplier' }), el('span', { text: 'Range' }), el('span', { text: 'What it rewards' })),
+        el('div', { class: 'mult-row' }, el('b', { text: 'Base' }), el('span', { class: 'num', text: 'TVL x 0.25' }), el('span', { text: 'Value already locked: the launch starts from a quarter of it.' })),
+        el('div', { class: 'mult-row' }, el('b', { text: 'Growth' }), el('span', { class: 'num', text: '0.64 – 1.72' }), el('span', { text: 'Seven-day momentum, clamped so one wild week cannot decide a rank.' })),
+        el('div', { class: 'mult-row' }, el('b', { text: 'Maturity' }), el('span', { class: 'num', text: '0.55 – 1.00' }), el('span', { text: 'Age with no token, over four years: the longer the record, the higher the score.' })),
+        el('div', { class: 'mult-row' }, el('b', { text: 'Chains' }), el('span', { class: 'num', text: '0.98 – 1.10' }), el('span', { text: 'Breadth: more chains means more users a launch could convert.' })),
+        el('div', { class: 'mult-row' }, el('b', { text: 'Category' }), el('span', { class: 'num', text: '0.92 – 1.08' }), el('span', { text: 'Where tokenless protocols sustain size, read off the snapshot medians.' }))
+      ),
+      el('p', { class: 'sub', text: 'The five multipliers are the whole model: nothing else moves a rank. TVL sets the order of magnitude; growth, maturity and chains move individual rows; the category factor nudges. A row\u2019s detail view shows its own five numbers, and the page recomputes the row from them, so the arithmetic is checkable on every row.' }),
       el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chain breadth adds at most 10%: a protocol on more chains has more users a launch could convert. Category is the snapshot\'s own median TVL per category over the global median, clamped to ' + m.category_floor + '–' + m.category_cap + ', so it can nudge a rank and never set one.' }),
       el('p', { class: 'sub', text: 'Left out of the board on purpose: wrapped, staked and bridged products, exchanges and versioned pools. Their token already trades, so ranking them as launches would be wrong. The snapshot records no token for a row; that is not proof it has none, and no airdrop is promised anywhere on this page.' })
     );
@@ -435,7 +563,11 @@
     shell.appendChild(highlights());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') {
+      shell.appendChild(moversPanel());
+      shell.appendChild(categoryPanel());
+      shell.appendChild(modelPanel());
+    }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
